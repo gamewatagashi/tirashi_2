@@ -183,26 +183,68 @@ def replace_cell_content(tc_xml: str, univ_name: str, schedule: str) -> str:
     return new_tc
 
 def replace_table_universities(xml: str, universities: list[dict]) -> str:
-    table_starts = [m.start() for m in re.finditer(r'<w:tbl>', xml)]
-    tc_pattern   = re.compile(r'<w:tc>.*?</w:tc>', re.DOTALL)
+    """Replace university table cells without changing XML structure.
 
-    for tbl_start in table_starts[:2]:
-        tbl_end  = xml.find('</w:tbl>', tbl_start) + len('</w:tbl>')
-        table    = xml[tbl_start:tbl_end]
-        tc_list  = list(tc_pattern.finditer(table))
-        new_table = table
-        offset   = 0
+    The previous implementation rebuilt cells using character offsets that
+    were calculated from the pre-edit XML.  That can duplicate a paragraph
+    tag when an earlier cell changes length, producing a DOCX that Word may
+    tolerate but LibreOffice rejects as an invalid source file.
+    """
+    tc_pattern = re.compile(r'<w:tc\b[^>]*>.*?</w:tc>', re.DOTALL)
+    table_pattern = re.compile(r'<w:tbl\b[^>]*>.*?</w:tbl>', re.DOTALL)
+    p_pattern = re.compile(r'<w:p\b[^>]*>.*?</w:p>', re.DOTALL)
+    wt_pattern = re.compile(r'<w:t\b[^>]*>.*?</w:t>', re.DOTALL)
 
-        for i, m in enumerate(tc_list):
-            name     = universities[i]['name']     if i < len(universities) else ''
-            schedule = universities[i]['schedule'] if i < len(universities) else ''
-            s, e     = m.start() + offset, m.end() + offset
-            new_tc   = replace_cell_content(new_table[s:e], name, schedule)
-            new_table = new_table[:s] + new_tc + new_table[e:]
-            offset   += len(new_tc) - (e - s)
+    # Only the first two tables are university tables in the supplied templates.
+    table_count = 0
+    univ_index = 0
 
-        xml = xml[:tbl_start] + new_table + xml[tbl_end:]
-    return xml
+    def replace_one_table(tm):
+        nonlocal table_count, univ_index
+        table_count += 1
+        if table_count > 2:
+            return tm.group(0)
+
+        table_xml = tm.group(0)
+
+        def replace_one_cell(cm):
+            nonlocal univ_index
+            cell = cm.group(0)
+            name = universities[univ_index]['name'] if univ_index < len(universities) else ''
+            schedule = universities[univ_index]['schedule'] if univ_index < len(universities) else ''
+            univ_index += 1
+
+            paragraphs = list(p_pattern.finditer(cell))
+            if len(paragraphs) < 1:
+                return cell
+
+            replacements = [name, schedule]
+            for pidx, text in enumerate(replacements):
+                paragraphs = list(p_pattern.finditer(cell))
+                if pidx >= len(paragraphs):
+                    break
+                ps, pe = paragraphs[pidx].span()
+                para = paragraphs[pidx].group(0)
+                wts = list(wt_pattern.finditer(para))
+                if not wts:
+                    continue
+                ws, we = wts[0].span()
+                new_t = f'<w:t xml:space="preserve">{_xml_escape(text)}</w:t>'
+                para = para[:ws] + new_t + para[we:]
+                cell = cell[:ps] + para + cell[pe:]
+
+            # Clear unused paragraphs after the two data rows.
+            paragraphs = list(p_pattern.finditer(cell))
+            for p_match in reversed(paragraphs[2:]):
+                para = p_match.group(0)
+                para = wt_pattern.sub('<w:t></w:t>', para)
+                ps, pe = p_match.span()
+                cell = cell[:ps] + para + cell[pe:]
+            return cell
+
+        return tc_pattern.sub(replace_one_cell, table_xml)
+
+    return table_pattern.sub(replace_one_table, xml)
 
 # ── Image replacement ─────────────────────────────────────────
 def replace_campus_image(work_dir: str, tmpl_key: int, new_image_path: str):

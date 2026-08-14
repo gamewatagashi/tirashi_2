@@ -29,6 +29,10 @@ if "oc_schedule" not in st.session_state:
     st.session_state.oc_schedule = {}      # {大学名: 日程}
 if "pref_map_imported" not in st.session_state:
     st.session_state.pref_map_imported = {}  # {都道府県名: [大学名,...]}  スプシから
+if "flyer_year" not in st.session_state:
+    st.session_state.flyer_year = 2026
+if "video_count" not in st.session_state:
+    st.session_state.video_count = 400
 
 SESSION_TMP = st.session_state.session_tmp_dir
 
@@ -126,8 +130,9 @@ with st.sidebar:
                     sched[parts[0].strip()] = '\t'.join(parts[1:]).strip()
                 elif parts[0].strip():
                     sched[parts[0].strip()] = ''
-            st.session_state.oc_schedule.update(sched)
-            st.success(f"{len(sched)}件を反映しました")
+            st.session_state.oc_schedule = sched
+            st.session_state.pref_map_imported = {}
+            st.success(f"{len(sched)}件を反映しました（以前のデータは置き換えました）")
 
     # ── B: ファイルアップロード ──────────────────────────────
     elif import_method == "📁 ファイルをアップロード":
@@ -143,9 +148,8 @@ with st.sidebar:
                     sched, pref_map = parse_spreadsheet(
                         uploaded_sheet.getvalue(), uploaded_sheet.name
                     )
-                    st.session_state.oc_schedule.update(sched)
-                    if pref_map:
-                        st.session_state.pref_map_imported.update(pref_map)
+                    st.session_state.oc_schedule = sched
+                    st.session_state.pref_map_imported = pref_map or {}
                     msg = f"日程データ {len(sched)}件を読み込みました"
                     if pref_map:
                         msg += f"、都道府県×大学マッピング {len(pref_map)}件も読み込みました"
@@ -166,9 +170,8 @@ with st.sidebar:
             with st.spinner("Google Sheetsからダウンロード中..."):
                 try:
                     sched, pref_map = parse_google_sheets_url(gs_url)
-                    st.session_state.oc_schedule.update(sched)
-                    if pref_map:
-                        st.session_state.pref_map_imported.update(pref_map)
+                    st.session_state.oc_schedule = sched
+                    st.session_state.pref_map_imported = pref_map or {}
                     msg = f"日程データ {len(sched)}件を読み込みました"
                     if pref_map:
                         msg += f"、都道府県×大学 {len(pref_map)}件も読み込みました"
@@ -194,10 +197,17 @@ with st.sidebar:
         st.caption("日程データ未読み込み（上で読み込んでください）")
 
     st.divider()
+    st.subheader("📝 毎年変更する設定")
+    st.number_input("チラシ年度", min_value=2020, max_value=2100, step=1, key="flyer_year", help="毎年ここだけ変更してください。")
+    st.number_input("大学紹介動画の掲載数", min_value=0, max_value=99999, step=10, key="video_count", help="「現在、約○○の大学紹介動画を掲載中！」の○○です。")
+
     if DRIVE_OK:
         st.success("✅ Google Drive 連携: 有効")
     else:
         st.info("ℹ️ Google Drive 連携: 未設定")
+
+flyer_year = int(st.session_state.flyer_year)
+video_count = int(st.session_state.video_count)
 
 # ════════════════════════════════════════════════════════════════
 # TABS
@@ -345,7 +355,7 @@ with tab_single:
             st.stop()
 
         suffix    = pref_suffix(pref_name)
-        base_name = f"{pref_num:02d}_{pref_name}{suffix}_oc2026"
+        base_name = f"{pref_num:02d}_{pref_name}{suffix}_oc{flyer_year}"
 
         with st.spinner("生成中..."):
             with tempfile.TemporaryDirectory() as tmp:
@@ -356,6 +366,8 @@ with tab_single:
                     generate_chirashi(
                         pref_num, pref_name, univs, campus_path, docx_out,
                         template_path_override=tmpl_path,
+                        flyer_year=flyer_year,
+                        video_count=video_count,
                     )
                     docx_bytes = open(docx_out, 'rb').read()
                     st.success("✅ 生成完了！")
@@ -487,7 +499,7 @@ with tab_batch:
 
                 univs         = [{'name': n, 'schedule': oc_schedule.get(n, '')} for n in names]
                 suffix        = pref_suffix(p_name)
-                base_name     = f"{p_num:02d}_{p_name}{suffix}_oc2026"
+                base_name     = f"{p_num:02d}_{p_name}{suffix}_oc{flyer_year}"
                 campus_path   = resolve_campus_image(names[0], None, tmp, batch_use_drive_photo)
                 tmpl_path, _  = resolve_template_path(len(univs), tmp, batch_use_drive_template)
 
@@ -498,6 +510,8 @@ with tab_batch:
                     'universities':         univs,
                     'campus_image_path':    campus_path,
                     'template_path_override': tmpl_path,
+                    'flyer_year': flyer_year,
+                    'video_count': video_count,
                 })
 
             with st.spinner(f"{len(jobs)}件を生成中..."):

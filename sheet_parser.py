@@ -18,6 +18,7 @@ import io
 import re
 import unicodedata
 import pandas as pd
+from univ_utils import canonical_university_name
 
 
 # ── 内部ユーティリティ ─────────────────────────────────────────
@@ -73,20 +74,28 @@ def _parse_oc_sheet(df: pd.DataFrame) -> dict[str, str]:
     if univ_col is None:
         return schedule
 
-    # 日程列: 大学名列より右で、日付パターンを含む列
-    date_patterns = re.compile(r'\d+[/月]\d+|オンライン|来場|事前')
+    # 日程列: 日付パターンだけでなく「今日」「明日」「未定」なども認識。
+    # それでも見つからない場合は、大学名列の直後にある非空列を候補にする。
+    date_patterns = re.compile(r'\d+[/月]\d+|オンライン|来場|事前|今日|明日|未定|随時|開催')
     for col_idx in range(univ_col + 1, min(len(df.columns), 12)):
-        sample = [str(v) for v in df.iloc[:, col_idx].dropna().head(15)]
-        if sum(bool(date_patterns.search(s)) for s in sample) >= 2:
+        sample = [str(v).strip() for v in df.iloc[:, col_idx].dropna().head(30)]
+        if sum(bool(date_patterns.search(s)) for s in sample) >= 1:
             date_col = col_idx
             break
 
     if date_col is None:
-        # 日程列が見つからなければ大学名だけでも返す（日程は空）
+        for col_idx in range(univ_col + 1, min(len(df.columns), 12)):
+            sample = [str(v).strip() for v in df.iloc[:, col_idx].dropna().head(30)]
+            nonempty = [s for s in sample if s and s.lower() not in ('nan','none')]
+            if len(nonempty) >= 2:
+                date_col = col_idx
+                break
+
+    if date_col is None:
         for _, row in df.iterrows():
             val = row.iloc[univ_col] if univ_col < len(row) else None
             if _is_univ_name(val):
-                name = _normalize(str(val))
+                name = canonical_university_name(_normalize(str(val)))
                 if name:
                     schedule[name] = ""
         return schedule
@@ -98,7 +107,7 @@ def _parse_oc_sheet(df: pd.DataFrame) -> dict[str, str]:
         if not _is_univ_name(univ_val):
             continue
 
-        name     = _normalize(str(univ_val))
+        name     = canonical_university_name(_normalize(str(univ_val)))
         date_str = _normalize(str(date_val)) if date_val not in (None, "", "nan", "None") else ""
 
         # 改行を「／」に変換して短くする
@@ -171,7 +180,7 @@ def _parse_pref_sheet(df: pd.DataFrame) -> dict[str, list[str]]:
 
         # 「（）」内の補足を除去して分割
         raw = re.sub(r'[（(][^）)]*[）)]', '', raw)
-        univs = [u.strip() for u in re.split(r'[、,，]+', raw) if u.strip() and len(u.strip()) >= 2]
+        univs = [canonical_university_name(u.strip()) for u in re.split(r'[、,，]+', raw) if u.strip() and len(u.strip()) >= 2]
 
         if pref and univs:
             pref_map[pref] = univs

@@ -3,32 +3,27 @@ OC Chirashi Generator - Core document generation logic
 """
 import re, os, zipfile, tempfile, io
 from PIL import Image
-from lxml import etree
-
-NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+from univ_utils import canonical_university_name, cover_university
 
 BASE_DIR     = os.path.dirname(__file__)
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 IMAGE_DIR    = os.path.join(BASE_DIR, "images")
-FONT_NAME = "UD デジタル 教科書体 NP-B"
-DEFAULT_FLYER_YEAR = 2026
-DEFAULT_VIDEO_COUNT = 400
 
 TEMPLATE_MAP = {6: "template_6.docx", 8: "template_8.docx",
                 10: "template_10.docx", 12: "template_12.docx"}
 
 # The large campus photo filename(s) per template (may be duplicated for textbox copy)
 CAMPUS_IMAGE_MAP = {
-    6:  ["image1.jpeg"],
+    6:  ["image1.png"],
     8:  ["image3.jpeg", "image7.jpeg"],
-    10: ["image1.jpeg"],
+    10: ["image1.png"],
     12: ["image3.png",  "image7.png"],
 }
 
 # Placeholder text in title paragraphs per template
 # Structure: ['PREF', '県の'] or ['PREF', '大学'] as split runs
-TITLE_PREF_PLACEHOLDER = {6: "山口", 8: "徳島", 10: "滋賀", 12: "〇〇"}
-TITLE_UNIV_PLACEHOLDER = {6: "山口", 8: "徳島", 10: "滋賀", 12: "〇〇"}
+TITLE_PREF_PLACEHOLDER = {6: "〇〇", 8: "徳島", 10: "○○", 12: "〇〇"}
+TITLE_UNIV_PLACEHOLDER = {6: "〇〇", 8: "徳島", 10: "○○", 12: "〇〇"}
 
 # ── Image helpers ─────────────────────────────────────────────
 def get_available_images() -> dict:
@@ -38,7 +33,7 @@ def get_available_images() -> dict:
     for fname in os.listdir(IMAGE_DIR):
         if not fname.lower().endswith(('.jpg', '.jpeg')):
             continue
-        name = fname.split('pixta_')[0].split('_pixta')[0].strip().rstrip('_').strip()
+        name = canonical_university_name(fname.split('pixta_')[0].split('_pixta')[0].strip().rstrip('_').strip())
         if not name or name.startswith('pixta'):
             continue
         images.setdefault(name, []).append(os.path.join(IMAGE_DIR, fname))
@@ -47,6 +42,7 @@ def get_available_images() -> dict:
 def find_best_image(university_name: str) -> str | None:
     if not university_name:
         return None
+    university_name = canonical_university_name(university_name)
     images = get_available_images()
     def pick(paths):
         for p in paths:
@@ -98,35 +94,60 @@ def _xml_escape(text: str) -> str:
             .replace('>', '&gt;'))
 
 def replace_title(xml: str, tmpl_key: int, pref_name: str, main_univ: str) -> str:
-    """Replace the duplicated title textboxes without leaving old suffix text."""
-    root = etree.fromstring(xml.encode('utf-8'))
-    old_ph = TITLE_PREF_PLACEHOLDER[tmpl_key]
-    suffix = pref_suffix(pref_name)
-    univ_replaced = 0
-    pref_replaced = 0
-    for p in root.xpath('.//w:p', namespaces=NS):
-        texts = p.xpath('./w:r/w:t/text()', namespaces=NS)
-        if not texts:
-            continue
-        joined = ''.join(texts).strip()
-        # University title: placeholder + "大学" in the original template.
-        if univ_replaced < 2 and old_ph in texts and '大学' in texts:
-            _set_paragraph_text(p, main_univ)
-            univ_replaced += 1
-            continue
-        # Prefecture title: placeholder + "県の/府の/都の/の".
-        if pref_replaced < 2 and old_ph in texts and any('の' in t for t in texts):
-            runs = p.xpath('./w:r/w:t', namespaces=NS)
-            if runs:
-                runs[0].text = pref_name + suffix
-                runs[0].set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                if len(runs) >= 2:
-                    runs[1].text = 'の'
-                    runs[1].set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                for node in runs[2:]:
-                    node.text = ''
-            pref_replaced += 1
-    return etree.tostring(root, encoding='unicode', xml_declaration=False)
+    """Replace title text only in the document header area (before the first table).
+    This avoids confusing the title with university-table cells and works across
+    the 6/8/10/12 templates, whose placeholder spellings differ.
+    """
+    table_pos = xml.find('<w:tbl')
+    if table_pos < 0:
+        table_pos = len(xml)
+    head, tail = xml[:table_pos], xml[table_pos:]
+    p_pattern = re.compile(r'(<w:p\b[^>]*>)(.*?)(</w:p>)', re.DOTALL)
+    wt_pattern = re.compile(r'<w:t\b[^>]*>.*?</w:t>', re.DOTALL)
+    pref_done=0
+    univ_done=0
+
+    def process(m):
+        nonlocal pref_done, univ_done
+        body=m.group(2)
+        vals=re.findall(r'<w:t\b[^>]*>(.*?)</w:t>',body,re.DOTALL)
+        vals=[re.sub(r'<[^>]+>','',v) for v in vals]
+        full=''.join(vals).strip()
+        if not full:
+            return m.group(0)
+
+        # Prefecture title: e.g. 「神奈川県の」「〇〇県の」
+        if full.endswith(('県の','府の','都の')) and pref_done < 2:
+            matches=list(wt_pattern.finditer(body))
+            if matches:
+                first=matches[0]
+                body=body[:first.start()]+f'<w:t xml:space="preserve">{_xml_escape(pref_name)}</w:t>'+body[first.end():]
+                matches=list(wt_pattern.finditer(body))
+                if len(matches)>1:
+                    second=matches[1]
+                    body=body[:second.start()]+f'<w:t xml:space="preserve">{_xml_escape(pref_suffix(pref_name)+"の")}</w:t>'+body[second.end():]
+                    matches=list(wt_pattern.finditer(body))
+                    for mm in reversed(matches[2:]):
+                        body=body[:mm.start()]+'<w:t></w:t>'+body[mm.end():]
+                pref_done += 1
+                return m.group(1)+body+m.group(3)
+
+        # Featured university title: short paragraph ending in 「大学」
+        # and located before the first table.
+        if full.endswith('大学') and len(full) <= 12 and univ_done < 2:
+            matches=list(wt_pattern.finditer(body))
+            if matches:
+                first=matches[0]
+                body=body[:first.start()]+f'<w:t xml:space="preserve">{_xml_escape(main_univ)}</w:t>'+body[first.end():]
+                matches=list(wt_pattern.finditer(body))
+                for mm in reversed(matches[1:]):
+                    body=body[:mm.start()]+'<w:t></w:t>'+body[mm.end():]
+                univ_done += 1
+                return m.group(1)+body+m.group(3)
+        return m.group(0)
+
+    head=p_pattern.sub(process,head)
+    return head+tail
 
 # ── Table replacement ─────────────────────────────────────────
 def replace_cell_content(tc_xml: str, univ_name: str, schedule: str) -> str:
@@ -160,52 +181,55 @@ def replace_cell_content(tc_xml: str, univ_name: str, schedule: str) -> str:
 
     return new_tc
 
-def _set_paragraph_text(paragraph, text: str):
-    """Replace all visible text in one paragraph while preserving its formatting."""
-    text = '' if text is None else str(text)
-    runs = paragraph.xpath('./w:r/w:t', namespaces=NS)
-    if not runs:
-        return
-    # Put all text in the first text node and clear the rest. This is important
-    # because the supplied templates split strings such as "〇〇大学" into
-    # multiple runs ("〇〇" + "大学"). Replacing only the first run leaves
-    # stale text such as "関関同立東京大学" behind.
-    runs[0].text = text
-    for node in runs[1:]:
-        node.text = ''
-    if text:
-        runs[0].set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-
-
 def replace_table_universities(xml: str, universities: list[dict]) -> str:
-    """Replace the university cells in both duplicated table copies.
-
-    Each supplied template has two identical copies of the university table
-    (one is used for the textbox/print layout). A cell's first paragraph is
-    the university name and the second paragraph is its OC schedule. The
-    original template contains last year's sample text, often split across
-    many runs/paragraphs. We replace the *entire* first two paragraphs and
-    blank all remaining paragraphs, so no old university or date can leak
-    into the new flyer.
-    """
-    root = etree.fromstring(xml.encode('utf-8'))
-    tables = root.xpath('.//w:tbl', namespaces=NS)
+    """Replace each university cell's two paragraphs, clearing all old text nodes."""
+    tc_pattern = re.compile(r'<w:tc\b[^>]*>.*?</w:tc>', re.DOTALL)
+    table_pattern = re.compile(r'<w:tbl\b[^>]*>.*?</w:tbl>', re.DOTALL)
+    p_pattern = re.compile(r'<w:p\b[^>]*>.*?</w:p>', re.DOTALL)
+    wt_pattern = re.compile(r'<w:t\b[^>]*>.*?</w:t>', re.DOTALL)
+    table_count = 0
     univ_index = 0
-    for table in tables[:2]:
-        cells = table.xpath('.//w:tr/w:tc', namespaces=NS)
-        for cell in cells:
+
+    def replace_one_table(tm):
+        nonlocal table_count, univ_index
+        table_count += 1
+        if table_count > 2:
+            return tm.group(0)
+        table_xml = tm.group(0)
+
+        def replace_one_cell(cm):
+            nonlocal univ_index
+            cell = cm.group(0)
             name = universities[univ_index]['name'] if univ_index < len(universities) else ''
             schedule = universities[univ_index]['schedule'] if univ_index < len(universities) else ''
             univ_index += 1
-            paragraphs = cell.xpath('./w:p', namespaces=NS)
-            if not paragraphs:
-                continue
-            _set_paragraph_text(paragraphs[0], name)
-            if len(paragraphs) >= 2:
-                _set_paragraph_text(paragraphs[1], schedule)
-            for p in paragraphs[2:]:
-                _set_paragraph_text(p, '')
-    return etree.tostring(root, encoding='unicode', xml_declaration=False)
+            paragraphs=list(p_pattern.finditer(cell))
+            for pidx, text in enumerate([name, schedule]):
+                paragraphs=list(p_pattern.finditer(cell))
+                if pidx >= len(paragraphs):
+                    break
+                ps,pe=paragraphs[pidx].span()
+                para=paragraphs[pidx].group(0)
+                wts=list(wt_pattern.finditer(para))
+                if not wts:
+                    continue
+                # Put all replacement text into the first run and clear the rest.
+                first=wts[0]
+                new_t=f'<w:t xml:space="preserve">{_xml_escape(text)}</w:t>'
+                para=para[:first.start()]+new_t+para[first.end():]
+                wts2=list(wt_pattern.finditer(para))
+                for mm in reversed(wts2[1:]):
+                    para=para[:mm.start()]+'<w:t></w:t>'+para[mm.end():]
+                cell=cell[:ps]+para+cell[pe:]
+            # Clear unused paragraphs
+            paragraphs=list(p_pattern.finditer(cell))
+            for p_match in reversed(paragraphs[2:]):
+                para=wt_pattern.sub('<w:t></w:t>', p_match.group(0))
+                ps,pe=p_match.span()
+                cell=cell[:ps]+para+cell[pe:]
+            return cell
+        return tc_pattern.sub(replace_one_cell, table_xml)
+    return table_pattern.sub(replace_one_table, xml)
 
 # ── Image replacement ─────────────────────────────────────────
 def replace_campus_image(work_dir: str, tmpl_key: int, new_image_path: str):
@@ -217,59 +241,71 @@ def replace_campus_image(work_dir: str, tmpl_key: int, new_image_path: str):
         fmt = 'JPEG' if ext in ('jpg', 'jpeg') else 'PNG'
         img.save(dst, fmt, quality=90)
 
-def apply_document_customizations(xml: str, flyer_year: int, video_count: int) -> str:
-    """Apply yearly values and normalize font names in all visible text runs."""
-    root = etree.fromstring(xml.encode('utf-8'))
-    year = int(flyer_year)
-    count = int(video_count)
+# ── Annual settings / font normalization ─────────────────────
+def _replace_paragraph_text(xml: str, predicate, new_text: str) -> str:
+    p_pattern = re.compile(r'(<w:p\b[^>]*>)(.*?)(</w:p>)', re.DOTALL)
+    wt_pattern = re.compile(r'<w:t\b[^>]*>.*?</w:t>', re.DOTALL)
+    def repl(m):
+        body=m.group(2)
+        texts=[re.sub(r'<[^>]+>','',x) for x in re.findall(r'<w:t\b[^>]*>(.*?)</w:t>', body, re.DOTALL)]
+        full=''.join(texts)
+        if not predicate(full):
+            return m.group(0)
+        wts=list(wt_pattern.finditer(body))
+        if not wts:
+            return m.group(0)
+        first=wts[0]
+        new_t=f'<w:t xml:space="preserve">{_xml_escape(new_text)}</w:t>'
+        body=body[:first.start()]+new_t+body[first.end():]
+        # Clear all subsequent text nodes, but preserve their runs/styles.
+        matches=list(wt_pattern.finditer(body))
+        if len(matches)>1:
+            for mm in reversed(matches[1:]):
+                body=body[:mm.start()]+'<w:t></w:t>'+body[mm.end():]
+        return m.group(1)+body+m.group(3)
+    return p_pattern.sub(repl, xml)
 
-    # Text in the templates is sometimes split across multiple <w:t> runs
-    # (e.g. "現在、約" + "40" + "0の大学紹介動画..."). Work at paragraph
-    # level so the yearly number can never be left half-old/half-new.
-    for p in root.xpath('.//w:p', namespaces=NS):
-        texts = p.xpath('./w:r/w:t/text()', namespaces=NS)
-        if not texts:
-            continue
-        joined = ''.join(texts)
-        if '現在、約' in joined and '大学紹介動画を掲載中！' in joined:
-            new_text = re.sub(
-                r'現在、約[0-9０-９,，]+の大学紹介動画を掲載中！',
-                f'現在、約{count:,}の大学紹介動画を掲載中！',
-                joined,
-            )
-            _set_paragraph_text(p, new_text)
-        elif 'オープンキャンパス' in joined and re.search(r'20\d{2}', joined):
-            new_text = re.sub(r'オープンキャンパス20\d{2}', f'オープンキャンパス{year}', joined)
-            _set_paragraph_text(p, new_text)
+def apply_annual_settings(xml: str, year: int, video_count: int) -> str:
+    # Only touch the two dedicated paragraphs, leaving the rest of the template intact.
+    xml = _replace_paragraph_text(
+        xml, lambda s: 'オープンキャンパス' in s and ('2026' in s or '2025' in s or '2027' in s),
+        f'オープンキャンパス {year}'
+    )
+    xml = _replace_paragraph_text(
+        xml, lambda s: '現在、約' in s and '大学紹介動画' in s,
+        f'現在、約 {video_count} の大学紹介動画を掲載中！'
+    )
+    return xml
 
-    # Normalize every run-level font declaration in the generated front page.
-    # This removes the mixed NP-B/NK-B/UD Digi/MS P Gothic definitions that
-    # caused different fallback fonts after LibreOffice PDF conversion.
-    font_qname = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-    for rfonts in root.xpath('.//w:rFonts', namespaces=NS):
-        for attr in ('ascii', 'eastAsia', 'hAnsi', 'cs'):
-            q = font_qname + attr
-            if q in rfonts.attrib:
-                rfonts.set(q, FONT_NAME)
-    return etree.tostring(root, encoding='unicode', xml_declaration=False)
-
+def force_document_font(xml: str, font_name: str = 'UD デジタル 教科書体 NP-B') -> str:
+    def repl(m):
+        tag=m.group(0)
+        tag=re.sub(r'\s+(?:w:ascii|w:hAnsi|w:eastAsia|w:cs)="[^"]*"', '', tag)
+        tag=tag[:-2] if tag.endswith('/>') else tag[:-1]
+        return tag + f' w:ascii="{font_name}" w:eastAsia="{font_name}" w:hAnsi="{font_name}" w:cs="{font_name}"/>'
+    return re.sub(r'<w:rFonts\b[^>]*/>', repl, xml)
 
 # ── Main entry point ──────────────────────────────────────────
 def generate_chirashi(pref_num, pref_name, universities, campus_image_path, output_path,
-                       template_path_override: str | None = None,
-                       flyer_year: int = DEFAULT_FLYER_YEAR,
-                       video_count: int = DEFAULT_VIDEO_COUNT) -> str:
+                       template_path_override: str | None = None, year: int = 2027, video_count: int = 500,
+                       cover_univ: str | None = None) -> str:
     num  = len(universities)
     _, tmpl_key = get_template_path(num)
     template_path = template_path_override if template_path_override else _
 
+    # Normalize university names so abbreviations in the master sheet match
+    # full-name photo files and yearly schedule data.
+    univs = [
+        {'name': canonical_university_name(u.get('name','')), 'schedule': u.get('schedule','')}
+        for u in universities
+    ]
     # Pad to fill template slots
-    univs = list(universities)
     while len(univs) < tmpl_key:
         univs.append({'name': '', 'schedule': ''})
 
     if not campus_image_path and univs:
-        campus_image_path = find_best_image(univs[0]['name'])
+        target_cover = cover_univ or cover_university(pref_name) or univs[0]['name']
+        campus_image_path = find_best_image(target_cover)
 
     with tempfile.TemporaryDirectory() as work_dir:
         with zipfile.ZipFile(template_path, 'r') as z:
@@ -279,10 +315,11 @@ def generate_chirashi(pref_num, pref_name, universities, campus_image_path, outp
         with open(doc_path, 'r', encoding='utf-8') as f:
             xml = f.read()
 
-        main_univ = univs[0]['name'] if univs[0]['name'] else pref_name + '大学'
+        main_univ = canonical_university_name(cover_univ or cover_university(pref_name) or univs[0]['name']) if univs and (cover_univ or cover_university(pref_name) or univs[0]['name']) else pref_name + '大学'
         xml = replace_title(xml, tmpl_key, pref_name, main_univ)
         xml = replace_table_universities(xml, univs)
-        xml = apply_document_customizations(xml, flyer_year, video_count)
+        xml = apply_annual_settings(xml, year, video_count)
+        xml = force_document_font(xml)
 
         with open(doc_path, 'w', encoding='utf-8') as f:
             f.write(xml)
@@ -373,8 +410,9 @@ def generate_batch_zip(jobs: list[dict], do_pdf: bool, do_back: bool,
                         job['pref_num'], job['pref_name'], job['universities'],
                         job.get('campus_image_path'), docx_out,
                         template_path_override=job.get('template_path_override'),
-                        flyer_year=job.get('flyer_year', DEFAULT_FLYER_YEAR),
-                        video_count=job.get('video_count', DEFAULT_VIDEO_COUNT),
+                        year=job.get('year', 2027),
+                        video_count=job.get('video_count', 500),
+                        cover_univ=job.get('cover_univ'),
                     )
                 except Exception as e:
                     warnings.append(f"{base_name}: 生成エラー ({e})")

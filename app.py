@@ -11,6 +11,7 @@ from generator import (
     get_available_images, find_best_image, find_all_images, get_template_path,
 )
 from sheet_parser import parse_spreadsheet, parse_google_sheets_url
+from univ_utils import canonical_university_name, cover_university
 import drive_helper as dh
 
 # ── Page config ───────────────────────────────────────────────
@@ -29,10 +30,6 @@ if "oc_schedule" not in st.session_state:
     st.session_state.oc_schedule = {}      # {大学名: 日程}
 if "pref_map_imported" not in st.session_state:
     st.session_state.pref_map_imported = {}  # {都道府県名: [大学名,...]}  スプシから
-if "flyer_year" not in st.session_state:
-    st.session_state.flyer_year = 2026
-if "video_count" not in st.session_state:
-    st.session_state.video_count = 400
 
 SESSION_TMP = st.session_state.session_tmp_dir
 
@@ -52,6 +49,12 @@ def load_images():
 df       = load_master()
 img_dict = load_images()
 DRIVE_OK = dh.drive_enabled()
+
+# 年ごとに変更する値。コードを書き換えず画面から変更できるようにする。
+with st.sidebar:
+    st.header("🗓 年度・掲載数")
+    flyer_year = st.number_input("チラシ年度", min_value=2020, max_value=2100, value=2027, step=1)
+    video_count = st.number_input("大学紹介動画の掲載数", min_value=0, max_value=9999, value=500, step=1)
 
 # ── Helpers ───────────────────────────────────────────────────
 def pref_suffix(name: str) -> str:
@@ -82,6 +85,15 @@ def resolve_campus_image(univ_name: str, uploaded_file, tmp_dir: str, use_drive:
             except Exception:
                 return None
     return None
+
+def normalize_schedule_dict(sched: dict) -> dict:
+    return {canonical_university_name(k): str(v).strip() for k, v in (sched or {}).items() if str(k).strip()}
+
+def normalize_pref_map(pref_map: dict) -> dict:
+    return {
+        str(pref).strip(): [canonical_university_name(x) for x in names if str(x).strip()]
+        for pref, names in (pref_map or {}).items()
+    }
 
 def resolve_template_path(tmpl_key: int, tmp_dir: str, use_drive_template: bool):
     local_path, key = get_template_path(tmpl_key)
@@ -130,9 +142,8 @@ with st.sidebar:
                     sched[parts[0].strip()] = '\t'.join(parts[1:]).strip()
                 elif parts[0].strip():
                     sched[parts[0].strip()] = ''
-            st.session_state.oc_schedule = sched
-            st.session_state.pref_map_imported = {}
-            st.success(f"{len(sched)}件を反映しました（以前のデータは置き換えました）")
+            st.session_state.oc_schedule = normalize_schedule_dict(sched)
+            st.success(f"{len(sched)}件を反映しました")
 
     # ── B: ファイルアップロード ──────────────────────────────
     elif import_method == "📁 ファイルをアップロード":
@@ -148,8 +159,9 @@ with st.sidebar:
                     sched, pref_map = parse_spreadsheet(
                         uploaded_sheet.getvalue(), uploaded_sheet.name
                     )
-                    st.session_state.oc_schedule = sched
-                    st.session_state.pref_map_imported = pref_map or {}
+                    st.session_state.oc_schedule = normalize_schedule_dict(sched)
+                    if pref_map:
+                        st.session_state.pref_map_imported = normalize_pref_map(pref_map)
                     msg = f"日程データ {len(sched)}件を読み込みました"
                     if pref_map:
                         msg += f"、都道府県×大学マッピング {len(pref_map)}件も読み込みました"
@@ -170,8 +182,9 @@ with st.sidebar:
             with st.spinner("Google Sheetsからダウンロード中..."):
                 try:
                     sched, pref_map = parse_google_sheets_url(gs_url)
-                    st.session_state.oc_schedule = sched
-                    st.session_state.pref_map_imported = pref_map or {}
+                    st.session_state.oc_schedule = normalize_schedule_dict(sched)
+                    if pref_map:
+                        st.session_state.pref_map_imported = normalize_pref_map(pref_map)
                     msg = f"日程データ {len(sched)}件を読み込みました"
                     if pref_map:
                         msg += f"、都道府県×大学 {len(pref_map)}件も読み込みました"
@@ -197,23 +210,16 @@ with st.sidebar:
         st.caption("日程データ未読み込み（上で読み込んでください）")
 
     st.divider()
-    st.subheader("📝 毎年変更する設定")
-    st.number_input("チラシ年度", min_value=2020, max_value=2100, step=1, key="flyer_year", help="毎年ここだけ変更してください。")
-    st.number_input("大学紹介動画の掲載数", min_value=0, max_value=99999, step=10, key="video_count", help="「現在、約○○の大学紹介動画を掲載中！」の○○です。")
-
     if DRIVE_OK:
         st.success("✅ Google Drive 連携: 有効")
     else:
         st.info("ℹ️ Google Drive 連携: 未設定")
 
-flyer_year = int(st.session_state.flyer_year)
-video_count = int(st.session_state.video_count)
-
 # ════════════════════════════════════════════════════════════════
 # TABS
 # ════════════════════════════════════════════════════════════════
-tab_single, tab_batch, tab_drive = st.tabs(
-    ["① 単体作成", "② まとめて作成", "⚙️ Google Drive連携"]
+tab_single, tab_batch, tab_manual, tab_drive = st.tabs(
+    ["① 単体作成", "② まとめて作成", "③ 完成PDF＋裏面", "⚙️ Google Drive連携"]
 )
 
 # ════════════════════════════════════════════════════════════════
@@ -235,15 +241,16 @@ with tab_single:
 
     # スプシからインポートした都道府県マッピングがあれば優先
     if pref_name in st.session_state.pref_map_imported:
-        default_list = st.session_state.pref_map_imported[pref_name]
+        default_list = [canonical_university_name(x) for x in st.session_state.pref_map_imported[pref_name]]
     else:
         raw_list     = [u.strip().strip('（）()') for u in default_univs_str.replace('、', ',').split(',')]
-        default_list = [u for u in raw_list if u]
+        default_list = [canonical_university_name(u) for u in raw_list if u]
 
     st.subheader("② 掲載大学数・テンプレート")
     col_a, col_b, col_c = st.columns([1, 2, 2])
     with col_a:
-        num_univ = st.select_slider("掲載大学数", options=[6, 8, 10, 12], value=12, key="single_num")
+        default_slots = min([6, 8, 10, 12], key=lambda x: abs(x-len(default_list))) if default_list else 6
+        num_univ = st.select_slider("掲載大学数", options=[6, 8, 10, 12], value=default_slots, key="single_num")
     with col_b:
         _, tmpl_key = get_template_path(num_univ)
         st.info(f"テンプレート: **{tmpl_key}大学フォーマット**")
@@ -272,7 +279,7 @@ with tab_single:
     for i, r in edited.iterrows():
         edited.at[i, '写真'] = '✅' if find_best_image(r['大学名']) else '❓'
 
-    main_univ = edited['大学名'].iloc[0] if len(edited) > 0 else ''
+    main_univ = cover_university(pref_name) or (edited['大学名'].iloc[0] if len(edited) > 0 else '')
 
     # ── 写真選択 ─────────────────────────────────────────────
     st.subheader("④ 表紙写真を選択")
@@ -355,19 +362,18 @@ with tab_single:
             st.stop()
 
         suffix    = pref_suffix(pref_name)
-        base_name = f"{pref_num:02d}_{pref_name}{suffix}_oc{flyer_year}"
+        base_name = f"{pref_num:02d}_{pref_name}{suffix}_oc{int(flyer_year)}"
 
         with st.spinner("生成中..."):
             with tempfile.TemporaryDirectory() as tmp:
-                campus_path    = selected_campus_path or find_best_image(univs[0]['name'])
+                campus_path    = selected_campus_path or find_best_image(main_univ)
                 tmpl_path, _   = resolve_template_path(num_univ, tmp, use_drive_template)
                 docx_out       = os.path.join(tmp, f'{base_name}.docx')
                 try:
                     generate_chirashi(
                         pref_num, pref_name, univs, campus_path, docx_out,
                         template_path_override=tmpl_path,
-                        flyer_year=flyer_year,
-                        video_count=video_count,
+                        year=int(flyer_year), video_count=int(video_count), cover_univ=main_univ,
                     )
                     docx_bytes = open(docx_out, 'rb').read()
                     st.success("✅ 生成完了！")
@@ -457,10 +463,10 @@ with tab_batch:
 
             # 大学リスト: スプシ優先 → マスタ
             if p_name in st.session_state.pref_map_imported:
-                names = st.session_state.pref_map_imported[p_name]
+                names = [canonical_university_name(x) for x in st.session_state.pref_map_imported[p_name]]
             else:
                 raw   = [u.strip().strip('（）()') for u in str(row['掲載大学']).replace('、',',').split(',')]
-                names = [u for u in raw if u]
+                names = [canonical_university_name(u) for u in raw]
 
             hit_count  = sum(1 for n in names if oc_schedule.get(n))
             img_count  = sum(1 for n in names if find_best_image(n))
@@ -489,18 +495,19 @@ with tab_batch:
                 row    = df[df['番号'] == p_num].iloc[0]
 
                 if p_name in st.session_state.pref_map_imported:
-                    names = st.session_state.pref_map_imported[p_name]
+                    names = [canonical_university_name(x) for x in st.session_state.pref_map_imported[p_name]]
                 else:
                     raw   = [u.strip().strip('（）()') for u in str(row['掲載大学']).replace('、',',').split(',')]
-                    names = [u for u in raw if u]
+                    names = [canonical_university_name(u) for u in raw]
 
                 if not names:
                     continue
 
-                univs         = [{'name': n, 'schedule': oc_schedule.get(n, '')} for n in names]
+                univs         = [{'name': canonical_university_name(n), 'schedule': oc_schedule.get(canonical_university_name(n), '')} for n in names]
                 suffix        = pref_suffix(p_name)
-                base_name     = f"{p_num:02d}_{p_name}{suffix}_oc{flyer_year}"
-                campus_path   = resolve_campus_image(names[0], None, tmp, batch_use_drive_photo)
+                base_name     = f"{p_num:02d}_{p_name}{suffix}_oc{int(flyer_year)}"
+                cover_name    = cover_university(p_name) or names[0]
+                campus_path   = resolve_campus_image(cover_name, None, tmp, batch_use_drive_photo)
                 tmpl_path, _  = resolve_template_path(len(univs), tmp, batch_use_drive_template)
 
                 jobs.append({
@@ -510,8 +517,9 @@ with tab_batch:
                     'universities':         univs,
                     'campus_image_path':    campus_path,
                     'template_path_override': tmpl_path,
-                    'flyer_year': flyer_year,
-                    'video_count': video_count,
+                    'year': int(flyer_year),
+                    'video_count': int(video_count),
+                    'cover_univ': cover_name,
                 })
 
             with st.spinner(f"{len(jobs)}件を生成中..."):
@@ -532,8 +540,60 @@ with tab_batch:
                     st.write(f"- {w}")
 
 
+
 # ════════════════════════════════════════════════════════════════
-# TAB 3: Google Drive 連携
+# TAB 3: 完成PDF＋裏面
+# ════════════════════════════════════════════════════════════════
+with tab_manual:
+    st.subheader("③ WordでPDF化した表面に裏面を付ける")
+    st.info(
+        "フォントやレイアウトを確実に保つため、Wordをお使いのPCでPDF化してから、"
+        "ここに表面PDFをアップロードする方法を推奨します。"
+    )
+    uploaded_pdfs = st.file_uploader(
+        "完成した表面PDFをアップロード（複数選択可）",
+        type=["pdf"], accept_multiple_files=True, key="manual_front_pdfs"
+    )
+    if uploaded_pdfs:
+        st.write(f"選択中：{len(uploaded_pdfs)}ファイル")
+        if st.button("📎 表面PDFに裏面を付ける", type="primary", use_container_width=True):
+            import zipfile as _zipfile
+            from pypdf import PdfReader, PdfWriter
+            results=[]
+            with tempfile.TemporaryDirectory() as tmp_manual:
+                for uf in uploaded_pdfs:
+                    front=os.path.join(tmp_manual, uf.name)
+                    with open(front,'wb') as f: f.write(uf.getvalue())
+                    out=os.path.join(tmp_manual, os.path.splitext(uf.name)[0] + "_表裏.pdf")
+                    try:
+                        writer=PdfWriter()
+                        for p in PdfReader(front).pages:
+                            writer.add_page(p)
+                        if os.path.exists(BACK_PDF):
+                            for p in PdfReader(BACK_PDF).pages:
+                                writer.add_page(p)
+                        with open(out,'wb') as f: writer.write(f)
+                        results.append(out)
+                    except Exception as e:
+                        st.error(f"{uf.name}: {e}")
+                if len(results)==1:
+                    st.download_button(
+                        "📄 完成PDFをダウンロード", data=open(results[0],'rb').read(),
+                        file_name=os.path.basename(results[0]), mime="application/pdf",
+                        use_container_width=True
+                    )
+                elif results:
+                    zipbuf=io.BytesIO()
+                    with _zipfile.ZipFile(zipbuf,'w',_zipfile.ZIP_DEFLATED) as z:
+                        for p in results: z.write(p, os.path.basename(p))
+                    st.download_button(
+                        "📦 完成PDFをまとめてダウンロード", data=zipbuf.getvalue(),
+                        file_name="oc_chirashi_completed_pdfs.zip", mime="application/zip",
+                        use_container_width=True
+                    )
+
+# ════════════════════════════════════════════════════════════════
+# TAB 4: Google Drive 連携
 # ════════════════════════════════════════════════════════════════
 with tab_drive:
     st.subheader("Google Drive 連携について")

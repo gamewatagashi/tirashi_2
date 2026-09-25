@@ -13,6 +13,7 @@ from generator import (
 from sheet_parser import parse_spreadsheet, parse_google_sheets_url
 from univ_utils import canonical_university_name, cover_university
 import drive_helper as dh
+from oc_research import research_university
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(page_title="OC チラシ生成", page_icon="🎓", layout="wide")
@@ -30,6 +31,8 @@ if "oc_schedule" not in st.session_state:
     st.session_state.oc_schedule = {}      # {大学名: 日程}
 if "pref_map_imported" not in st.session_state:
     st.session_state.pref_map_imported = {}  # {都道府県名: [大学名,...]}  スプシから
+if "research_results" not in st.session_state:
+    st.session_state.research_results = {}  # {大学名: 調査結果}
 
 SESSION_TMP = st.session_state.session_tmp_dir
 
@@ -208,6 +211,89 @@ with st.sidebar:
             st.rerun()
     else:
         st.caption("日程データ未読み込み（上で読み込んでください）")
+
+    # ── Gemini + Google Search（任意） ─────────────────────────
+    st.divider()
+    with st.expander("🔎 Geminiで大学公式情報を検索（任意）"):
+        st.caption(
+            "AI検索は補助機能です。検索結果は必ず下の日程表で確認・編集してください。"
+            "手入力・Excel/CSV・Google Sheetsからの独自情報もそのまま利用できます。"
+        )
+        gemini_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
+        if not gemini_key:
+            st.info(
+                "GEMINI_API_KEY未設定です。AI検索を使わない場合は設定不要です。"
+                "手入力・ファイル・Google Sheetsは通常どおり利用できます。"
+            )
+
+        research_raw = st.text_area(
+            "調査する大学（1行1大学）",
+            placeholder="例：\n京都大学\n大阪大学\n神戸大学",
+            key="research_universities",
+            height=120,
+        )
+        research_overwrite = st.checkbox(
+            "既存の日程がある大学もAI検索結果で上書きする",
+            value=False,
+            key="research_overwrite",
+            help="オフなら、既に入力済みの日程は保持し、空欄の大学だけAI結果を反映します。",
+        )
+
+        if st.button(
+            "🔎 Google検索で調査して日程表へ反映",
+            key="research_run",
+            disabled=not bool(gemini_key),
+        ):
+            names = [
+                canonical_university_name(x.strip())
+                for x in research_raw.splitlines()
+                if x.strip()
+            ]
+            names = list(dict.fromkeys(names))
+            if not names:
+                st.warning("大学名を1校以上入力してください。")
+            else:
+                results = {}
+                errors = []
+                progress = st.progress(0)
+                for i, name in enumerate(names, 1):
+                    try:
+                        result = research_university(name, int(flyer_year), gemini_key)
+                        results[name] = result
+                        schedule = str(result.get("schedule", "")).strip()
+                        current = st.session_state.oc_schedule.get(name, "").strip()
+                        if schedule and result.get("status") != "情報なし":
+                            if research_overwrite or not current:
+                                st.session_state.oc_schedule[name] = schedule
+                    except Exception as e:
+                        errors.append(f"{name}: {e}")
+                    progress.progress(i / len(names))
+
+                st.session_state.research_results.update(results)
+                st.success(
+                    f"調査完了：{len(results)}校。"
+                    "反映後の日程は下の既存データ表から自由に編集できます。"
+                )
+                if errors:
+                    with st.expander(f"⚠️ 調査できなかった大学（{len(errors)}校）"):
+                        for err in errors:
+                            st.write(f"- {err}")
+
+        if st.session_state.research_results:
+            st.caption("📚 AI検索結果・出典")
+            for name, result in st.session_state.research_results.items():
+                with st.expander(f"{name}：{result.get('status', '不明')}"):
+                    st.write(f"**日程:** {result.get('schedule', '―')}")
+                    st.write(f"**詳細:** {result.get('details', '―')}")
+                    sources = result.get("sources", [])
+                    if sources:
+                        st.write("**検索で参照したURL:**")
+                        for src in sources:
+                            url = src.get("url")
+                            title = src.get("title", url)
+                            if url:
+                                st.markdown(f"- [{title}]({url})")
+                    st.caption(f"調査日時: {result.get('checked_at', '―')}")
 
     st.divider()
     if DRIVE_OK:
@@ -644,4 +730,4 @@ drive_templates_folder_id = "フォルダID"   # テンプレートも共有す�
 """)
 
     st.divider()
-    st.caption("東進ハイスクール / 東進衛星予備校 | OC チラシ自動生成ツール v3.0")
+    st.caption("東進ハイスクール / 東進衛星予備校 | OC チラシ自動生成ツール v3.1")
